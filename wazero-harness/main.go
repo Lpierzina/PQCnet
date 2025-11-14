@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -11,6 +14,12 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"golang.org/x/crypto/blake2s"
+)
+
+const (
+	handshakeHeaderLen = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 32 + 32 + 8 + 8 + (2 * 5)
+	transcriptDomain   = "PQCNET_MLDSA_SIG_V1"
 )
 
 func main() {
@@ -44,25 +53,76 @@ func main() {
 	handshakeFn := exportedFunction(module, "pqc_handshake")
 
 	request := buildRequestPayload()
-	reqPtr := mustAllocAndWrite(ctx, module, allocFn, request)
+	dag := newDagHost()
+	dag.registerPayload(request.edgeID, request.bytes)
+	fmt.Printf("Handshake request (%d bytes, edge=%s): %q\n", len(request.bytes), request.edgeID, request.bytes)
 
-	const respLen = 64
+	reqPtr := mustAllocAndWrite(ctx, module, allocFn, request.bytes)
+
+	const respLen = 4096
 	respPtr := mustAlloc(ctx, module, allocFn, respLen)
 
-	written := callHandshake(ctx, handshakeFn, reqPtr, len(request), respPtr, respLen)
-	response := readFromMemory(module, respPtr, written)
+	written := callHandshake(ctx, handshakeFn, reqPtr, len(request.bytes), respPtr, respLen)
+	rawResponse := readFromMemory(module, respPtr, written)
 
-	freeBuffer(ctx, freeFn, reqPtr, len(request))
+	freeBuffer(ctx, freeFn, reqPtr, len(request.bytes))
 	freeBuffer(ctx, freeFn, respPtr, respLen)
 
-	fmt.Printf("Handshake request (%d bytes): %q\n", len(request), request)
-	fmt.Printf("Handshake response (%d bytes): %s\n", written, hex.EncodeToString(response))
+	envelope, err := parseHandshakeResponse(rawResponse)
+	if err != nil {
+		log.Fatalf("parse handshake response: %v", err)
+	}
+
+	registry := newKeyRegistry()
+	registry.persist(envelope)
+
+	fmt.Printf(
+		"Handshake OK → kem_key=%s signer=%s t=%d/%d ciphertext=%dB shared=%dB signature=%dB\n",
+		envelope.KemKeyID.Hex(),
+		envelope.SigningKeyID.Hex(),
+		envelope.Threshold.T,
+		envelope.Threshold.N,
+		len(envelope.Ciphertext),
+		len(envelope.SharedSecret),
+		len(envelope.Signature),
+	)
+
+	if err := verifyTranscript(envelope, request.bytes); err != nil {
+		log.Fatalf("transcript verification failed: %v", err)
+	}
+
+	if err := dag.verifyAndAnchor(
+		request.edgeID,
+		envelope.SigningKeyID,
+		envelope.Signature,
+		func(payload []byte) error {
+			return verifyTranscript(envelope, payload)
+		},
+	); err != nil {
+		log.Fatalf("qs-dag anchoring failed: %v", err)
+	}
+
+	fmt.Printf("QS-DAG anchor stored for edge=%s signer=%s\n", request.edgeID, envelope.SigningKeyID.Hex())
 }
 
-func buildRequestPayload() []byte {
+type handshakeInput struct {
+	bytes  []byte
+	edgeID string
+}
+
+func buildRequestPayload() handshakeInput {
 	now := time.Now().UTC()
 	payload := fmt.Sprintf("client=autheo-demo&ts=%d", now.UnixNano())
-	return []byte(payload)
+	data := []byte(payload)
+	return handshakeInput{
+		bytes:  data,
+		edgeID: deriveEdgeID(data),
+	}
+}
+
+func deriveEdgeID(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func exportedFunction(module api.Module, name string) api.Function {
@@ -146,8 +206,203 @@ func readFromMemory(module api.Module, ptr uint32, length int) []byte {
 	if !ok {
 		log.Fatalf("failed to read %d bytes from WASM memory @ %d", length, ptr)
 	}
-	// Copy into a Go-owned slice to avoid referencing WASM memory after it could be freed.
 	result := make([]byte, length)
 	copy(result, data)
 	return result
+}
+
+type keyID [32]byte
+
+func (k keyID) Hex() string {
+	return hex.EncodeToString(k[:])
+}
+
+type ThresholdPolicy struct {
+	T uint8
+	N uint8
+}
+
+type handshakeResponse struct {
+	Version      uint8
+	KemLevel     uint8
+	DsaLevel     uint8
+	Threshold    ThresholdPolicy
+	KemKeyID     keyID
+	SigningKeyID keyID
+	KemCreatedAt uint64
+	KemExpiresAt uint64
+	Ciphertext   []byte
+	SharedSecret []byte
+	Signature    []byte
+	KemPublicKey []byte
+	DsaPublicKey []byte
+}
+
+func parseHandshakeResponse(data []byte) (*handshakeResponse, error) {
+	if len(data) < handshakeHeaderLen {
+		return nil, fmt.Errorf("handshake response too short: %d bytes", len(data))
+	}
+	if !bytes.Equal(data[:4], []byte("PQC1")) {
+		return nil, fmt.Errorf("handshake magic mismatch: %x", data[:4])
+	}
+
+	header := data[:handshakeHeaderLen]
+	cursor := 4
+
+	resp := &handshakeResponse{}
+	resp.Version = header[cursor]
+	cursor++
+	resp.KemLevel = header[cursor]
+	cursor++
+	resp.DsaLevel = header[cursor]
+	cursor++
+	resp.Threshold.T = header[cursor]
+	cursor++
+	resp.Threshold.N = header[cursor]
+	cursor++
+	cursor++ // reserved
+
+	copy(resp.KemKeyID[:], header[cursor:cursor+32])
+	cursor += 32
+	copy(resp.SigningKeyID[:], header[cursor:cursor+32])
+	cursor += 32
+
+	resp.KemCreatedAt = binary.LittleEndian.Uint64(header[cursor : cursor+8])
+	cursor += 8
+	resp.KemExpiresAt = binary.LittleEndian.Uint64(header[cursor : cursor+8])
+	cursor += 8
+
+	cipherLen := binary.LittleEndian.Uint16(header[cursor : cursor+2])
+	cursor += 2
+	secretLen := binary.LittleEndian.Uint16(header[cursor : cursor+2])
+	cursor += 2
+	sigLen := binary.LittleEndian.Uint16(header[cursor : cursor+2])
+	cursor += 2
+	kemPkLen := binary.LittleEndian.Uint16(header[cursor : cursor+2])
+	cursor += 2
+	dsaPkLen := binary.LittleEndian.Uint16(header[cursor : cursor+2])
+	cursor += 2
+
+	expected := handshakeHeaderLen +
+		int(cipherLen) +
+		int(secretLen) +
+		int(sigLen) +
+		int(kemPkLen) +
+		int(dsaPkLen)
+	if len(data) != expected {
+		return nil, fmt.Errorf("handshake length mismatch: got %d want %d", len(data), expected)
+	}
+
+	offset := handshakeHeaderLen
+	resp.Ciphertext = copySection(data, offset, int(cipherLen))
+	offset += int(cipherLen)
+	resp.SharedSecret = copySection(data, offset, int(secretLen))
+	offset += int(secretLen)
+	resp.Signature = copySection(data, offset, int(sigLen))
+	offset += int(sigLen)
+	resp.KemPublicKey = copySection(data, offset, int(kemPkLen))
+	offset += int(kemPkLen)
+	resp.DsaPublicKey = copySection(data, offset, int(dsaPkLen))
+
+	return resp, nil
+}
+
+func copySection(src []byte, offset, length int) []byte {
+	section := make([]byte, length)
+	copy(section, src[offset:offset+length])
+	return section
+}
+
+type keyMetadata struct {
+	KeyID     string
+	Level     uint8
+	CreatedAt uint64
+	ExpiresAt uint64
+	Threshold ThresholdPolicy
+	PublicKey []byte
+}
+
+type keyRegistry struct {
+	kem map[string]keyMetadata
+	dsa map[string]keyMetadata
+}
+
+func newKeyRegistry() *keyRegistry {
+	return &keyRegistry{
+		kem: make(map[string]keyMetadata),
+		dsa: make(map[string]keyMetadata),
+	}
+}
+
+func (r *keyRegistry) persist(resp *handshakeResponse) {
+	kemKey := resp.KemKeyID.Hex()
+	r.kem[kemKey] = keyMetadata{
+		KeyID:     kemKey,
+		Level:     resp.KemLevel,
+		CreatedAt: resp.KemCreatedAt,
+		ExpiresAt: resp.KemExpiresAt,
+		Threshold: resp.Threshold,
+		PublicKey: append([]byte(nil), resp.KemPublicKey...),
+	}
+
+	dsaKey := resp.SigningKeyID.Hex()
+	r.dsa[dsaKey] = keyMetadata{
+		KeyID:     dsaKey,
+		Level:     resp.DsaLevel,
+		CreatedAt: resp.KemCreatedAt,
+		ExpiresAt: resp.KemExpiresAt,
+		Threshold: resp.Threshold,
+		PublicKey: append([]byte(nil), resp.DsaPublicKey...),
+	}
+}
+
+func verifyTranscript(resp *handshakeResponse, payload []byte) error {
+	transcript := make([]byte, 0, len(resp.Ciphertext)+len(resp.SharedSecret)+len(payload))
+	transcript = append(transcript, resp.Ciphertext...)
+	transcript = append(transcript, resp.SharedSecret...)
+	transcript = append(transcript, payload...)
+
+	digest, err := blake2s.New256(nil)
+	if err != nil {
+		return fmt.Errorf("blake2s init: %w", err)
+	}
+	digest.Write([]byte(transcriptDomain))
+	digest.Write(resp.DsaPublicKey)
+	digest.Write(transcript)
+	expected := digest.Sum(nil)
+
+	if !bytes.Equal(expected, resp.Signature) {
+		return fmt.Errorf("signature mismatch")
+	}
+	return nil
+}
+
+type dagHost struct {
+	payloads map[string][]byte
+	anchors  map[string][][]byte
+}
+
+func newDagHost() *dagHost {
+	return &dagHost{
+		payloads: make(map[string][]byte),
+		anchors:  make(map[string][][]byte),
+	}
+}
+
+func (d *dagHost) registerPayload(edgeID string, payload []byte) {
+	d.payloads[edgeID] = append([]byte(nil), payload...)
+}
+
+func (d *dagHost) verifyAndAnchor(edgeID string, signer keyID, signature []byte, verifyFn func(payload []byte) error) error {
+	payload, ok := d.payloads[edgeID]
+	if !ok {
+		return fmt.Errorf("edge %s payload missing", edgeID)
+	}
+	if err := verifyFn(payload); err != nil {
+		return err
+	}
+
+	key := fmt.Sprintf("%s::%s", edgeID, signer.Hex())
+	d.anchors[key] = append(d.anchors[key], append([]byte(nil), signature...))
+	return nil
 }

@@ -274,17 +274,43 @@ Roadmap
 
 ## WASM Handshake ABI & Go wazero Harness
 
-The crate now exports a minimal enclave surface so hosts can exercise it via
-WASM:
+The crate exports the enclave surface used by Autheo’s host runtime:
 
-- `pqc_alloc(len: u32) -> u32` / `pqc_free(ptr: u32, len: u32)` manage linear
-  memory without exposing the allocator directly.
-- `pqc_handshake(req_ptr, req_len, resp_ptr, resp_len) -> i32` consumes arbitrary
-  request bytes and writes a fixed 32-byte digest to `resp_ptr`. Non-negative
-  return values indicate the number of response bytes written; `-1` signals
+- `pqc_alloc(len: u32) -> u32` / `pqc_free(ptr: u32, len: u32)` – custom
+  allocator helpers for the host-side runtime.
+- `pqc_handshake(req_ptr, req_len, resp_ptr, resp_len) -> i32` – drives the full
+  ML-KEM + ML-DSA flow and writes a structured response into the caller’s buffer.
+  Non-negative return values indicate the number of bytes written; `-1` signals
   invalid input, `-2` indicates an undersized response buffer, and `-127`
-  captures internal errors. See `pqcnet-contracts/src/handshake.rs` for the
-  placeholder implementation.
+  captures internal errors.
+
+### Handshake record layout
+
+`execute_handshake` now emits a binary envelope composed of a fixed header
+followed by variable-length sections:
+
+| Offset | Size | Description |
+| --- | --- | --- |
+| 0   | 4   | Magic `PQC1` |
+| 4   | 1   | Version (`0x01`) |
+| 5   | 1   | ML-KEM security level tag |
+| 6   | 1   | ML-DSA security level tag |
+| 7   | 1   | Threshold `t` |
+| 8   | 1   | Threshold `n` |
+| 9   | 1   | Reserved |
+| 10  | 32  | Current ML-KEM `KeyId` |
+| 42  | 32  | Signing `KeyId` |
+| 74  | 8   | ML-KEM `created_at` (ms) |
+| 82  | 8   | ML-KEM `expires_at` (ms) |
+| 90  | 10  | Five little-endian `u16` lengths: ciphertext, shared secret, signature, ML-KEM public key, ML-DSA public key |
+| 100 | var | Ciphertext bytes |
+| …   | var | Shared secret bytes |
+| …   | var | ML-DSA signature |
+| …   | var | ML-KEM public key |
+| …   | var | ML-DSA public key |
+
+Hosts must provision a response buffer that can hold the header plus all
+sections (the wazero harness allocates 4 KiB for simplicity).
 
 ### Build the WASM artifact
 
@@ -302,43 +328,23 @@ go run . \
   -wasm ../pqcnet-contracts/target/wasm32-unknown-unknown/release/pqcnet_contracts.wasm
 ```
 
-The harness (see `wazero-harness/main.go`) allocates request/response buffers
-inside the module, invokes `pqc_handshake`, and prints the 32-byte digest in hex.
-This is the starting point for wiring the actual Kyber/Dilithium engines and
-embedding the enclave inside Autheo-One’s Go orchestrator.
+The harness now:
 
-### End-to-end flow
+1. Builds a nonce-bearing query string (`client=autheo-demo&ts=<unix-nanos>`)
+   and derives a deterministic DAG `edge_id`.
+2. Registers the request payload inside a mock `QsDagHost`.
+3. Calls `pqc_handshake` and parses the envelope into strongly typed metadata.
+4. Persists the advertised `KeyId`s, public keys, thresholds, and rotation data.
+5. Recomputes the ML-DSA transcript signature
+   (`ciphertext || shared_secret || request`) to mirror
+   `SignatureManager::sign_kem_transcript`.
+6. Invokes `QsDagPqc::verify_and_anchor` semantics in Go by re-verifying over
+   the stored DAG payload and recording the anchored signature.
 
-1. **Host request** – The Go harness builds a nonce-bearing string such as
-   `client=autheo-demo&ts=<unix-nanos>` (see `buildRequestPayload`) and writes
-   it into module memory using `pqc_alloc` + `Memory().Write`.
-2. **WASM call** – Host code allocates a 64-byte response buffer, calls
-   `pqc_handshake(req_ptr, req_len, resp_ptr, resp_len)`, and later frees both
-   buffers via `pqc_free`.
-3. **Contract logic** – Inside `pqc_handshake` (`src/wasm.rs`), the pointers are
-   reinterpreted as Rust slices and passed to `handshake::execute_handshake`.
-4. **Digest derivation** – `execute_handshake` prefixes the request with the
-   domain separator `b"PQCNET_HANDSHAKE_V0"` and hashes it with BLAKE2s, copying
-   the first 32 bytes into the caller-provided response slice. Any empty request
-   or undersized buffer is rejected with `PqcError`.
-5. **Result propagation** – Success returns the number of bytes written
-   (`32`). Errors map to stable codes returned to the host:
-   - `-1` → invalid input (null pointers / empty request);
-   - `-2` → response buffer too small;
-   - `-127` → catch-all internal error.
-6. **Host output** – The harness reads the reported number of bytes back out of
-   WASM memory, hex-encodes them, and logs both the request and deterministic
-   response digest. Replaying the exact same request reproduces the same digest,
-   which keeps the ABI stable while real ML-KEM/ML-DSA plumbing is brought
-   online.
-
-> ℹ️ Replacing the placeholder digest with a true PQC handshake simply means
-> swapping `execute_handshake` for logic that:
-> - pulls the current ML-KEM public key from `KeyManager`,
-> - runs `encapsulate_for_current()` to derive a shared secret,
-> - annotates/signs the transcript via `SignatureManager::sign_kem_transcript`,
-> - serializes the resulting ciphertext, shared secret handle, and signature
->   back to the host. The wasm/Go ABI remains the same.
+> ℹ️ The demo engines in `src/adapters.rs` are deterministic, BLAKE2s-based
+> stand-ins. Swap them for Autheo’s audited Kyber/Dilithium modules (or native
+> bindings) to obtain production-ready shared secrets and signatures without
+> touching the contract logic or harness.
 
 License
 

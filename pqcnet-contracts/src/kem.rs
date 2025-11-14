@@ -29,7 +29,7 @@ pub struct MlKemEncapsulation {
 /// - use NIST-compliant ML-KEM per FIPS 203,
 /// - provide constant-time behavior,
 /// - pass KATs and IND-CCA2 proofs in the host test suite.
-pub trait MlKem {
+pub trait MlKem: Send + Sync {
     /// Return the configured security level.
     fn level(&self) -> SecurityLevel;
 

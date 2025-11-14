@@ -15,7 +15,7 @@ pub struct MlDsaKeyPair {
 }
 
 /// Trait describing the host ML-DSA implementation.
-pub trait MlDsa {
+pub trait MlDsa: Send + Sync {
     /// Return the configured security level.
     fn level(&self) -> SecurityLevel;
 

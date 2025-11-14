@@ -19,12 +19,14 @@ use wee_alloc::WeeAlloc;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
+mod adapters;
 pub mod dsa;
 pub mod error;
 pub mod handshake;
 pub mod kem;
 pub mod key_manager;
 pub mod qs_dag;
+mod runtime;
 pub mod signatures;
 pub mod types;
 
