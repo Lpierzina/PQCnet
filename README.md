@@ -93,6 +93,14 @@ Threshold-sharing (e.g. Shamir with *t = 3*, *n = 5*) is treated as a **host res
 
 This separation keeps the contract simple and allows richer math libraries and HSMs off-chain.
 
+#### Secret Sharing Demo & Tests
+
+- `cargo test -p autheo-pqc-core secret_sharing` – exercises the 2-of-3 and 3-of-5 unit tests plus negative cases (duplicate indices, mismatched metadata) to prove `split_secret` / `combine_secret` correctness across thresholds.
+- `cargo run -p autheo-pqc-core --example secret_sharing_demo` – produces a narrated log that generates ML-KEM keys, splits them into tagged Shamir shares, reconstructs with just the quorum, and forces a rotation so you can show reshare behavior to stakeholders.
+- `cargo run -p autheo-pqc-core --bin liboqs_cli --features liboqs -- --message "veil handshake"` – swaps in liboqs-rs so the exact same sharing pipeline operates on audited Kyber/Dilithium keys (perfect for PM demos).
+- When presenting, capture the example/CLI output: every share prints `key_id`, version, timestamp, threshold, and `share_index`, satisfying the “securely store or transmit shares with metadata tagging” acceptance criterion.
+- To live-tune the policy, edit the `ThresholdPolicy { t, n }` constants inside `examples/secret_sharing_demo.rs` (e.g., switch to 4-of-7), rerun the example, and the log will highlight the new *t-of-n* math without touching the library code.
+
 ---
 
 ### 3. ML-DSA Signatures & Batch Verification
@@ -388,43 +396,108 @@ The runtime path for `issueHandshake` requests is implemented jointly by `autheo
 4. The host wraps this envelope into a QS-DAG `edge` payload and invokes its `QsDagHost` implementation; `QsDagPqc::verify_and_anchor` replays the Dilithium verification before gossiping to validators.
 5. Validators attest to the edge, after which the host returns the finalized shared secret, DAG edge metadata, and routing hints to the client.
 
-```mermaid
----
-config:
-  look: neo
-  theme: redux-color
----
-sequenceDiagram
-    autonumber
-    participant C as Client / Zer0Veil Node
-    participant H as PQCNet Host<br/>(Go / Rust runtime)
-    participant W as PQC WASM Engine<br/>(Kyber + Dilithium)
-    participant D as QS-DAG Host<br/>(Validator logic)
-    participant V as Validator Set
-    Note over C,H: 1) Client asks for quantum-safe tunnel / route
-    C->>H: issueHandshake(sessionId, intents, nodeId)
-    Note over H,W: 2) Host calls WASM pqc_handshake()
-    H->>W: pqc_handshake(requestJSON)
-    activate W
-    Note over W: 3) Inside WASM: use Kyber & Dilithium<br/>from autheo-pqc-core
-    W->>W: Kyber.encapsulate() → ciphertext + sharedSecret
-    W->>W: Dilithium.sign(transcript) → signature
-    W-->>H: handshakeEnvelopeJSON<br/>(keys, ciphertext, sharedSecret, signature)
-    deactivate W
-    Note over H,D: 4) Host builds DAG edge payload
-    H->>D: submitEdgeRequest(handshakeEnvelope)
-    Note over D: 5) QS-DAG host verifies PQC envelope
-    D->>D: verifyTranscript(envelope, originalRequest)
-    D->>D: check Dilithium signature + Kyber metadata
-    D-->>V: gossipEdge(edgeID, envelope, parents)
-    Note over V: 6) Validators anchor edge in QS-DAG
-    V->>V: verify edge (PQC + parents)
-    V-->>D: edgeAccepted(edgeID)
-    Note over D,H: 7) DAG host confirms anchoring
-    D-->>H: edgeAnchored(edgeID, status=finalized)
-    Note over H,C: 8) Host returns tunnel + edge info
-    H-->>C: HandshakeResult<br/>sharedSecret + dagEdgeId + routes
-```
+The interactive map below links each step to the exact implementation—hover to highlight, click to open the file in this workspace.
+
+<figure>
+  <svg width="940" height="320" viewBox="0 0 940 320" role="img" aria-labelledby="handshake-flow" xmlns="http://www.w3.org/2000/svg">
+    <title id="handshake-flow">QS-DAG handshake code map</title>
+    <style>
+      .node {
+        fill: #ffffff;
+        stroke: #0a84ff;
+        stroke-width: 2;
+        rx: 12;
+      }
+      .passive {
+        stroke-dasharray: 6 6;
+        fill: #f5f7fb;
+      }
+      text {
+        font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 12px;
+        fill: #0a1c2d;
+      }
+      .title {
+        font-weight: 600;
+      }
+      a:hover .node {
+        fill: #e4f0ff;
+      }
+      line {
+        stroke: #0a84ff;
+        stroke-width: 2;
+      }
+    </style>
+    <defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L10,5 L0,10 z" fill="#0a84ff" />
+      </marker>
+    </defs>
+    <g>
+      <rect class="node passive" x="10" y="40" width="140" height="80"/>
+      <text x="80" y="70" text-anchor="middle">
+        <tspan class="title">Client</tspan>
+        <tspan x="80" dy="18">issueHandshake()</tspan>
+      </text>
+      <a href="./wazero-harness/main.go">
+        <rect class="node" x="170" y="40" width="170" height="80"/>
+        <text x="255" y="66" text-anchor="middle">
+          <tspan class="title">Host runtime</tspan>
+          <tspan x="255" dy="18">wazero-harness/main.go</tspan>
+        </text>
+      </a>
+      <a href="./pqcnet-contracts/autheo-pqc-wasm/src/lib.rs">
+        <rect class="node" x="360" y="40" width="170" height="80"/>
+        <text x="445" y="66" text-anchor="middle">
+          <tspan class="title">WASM boundary</tspan>
+          <tspan x="445" dy="18">autheo-pqc-wasm/src/lib.rs</tspan>
+        </text>
+      </a>
+      <a href="./pqcnet-contracts/autheo-pqc-core/src/handshake.rs">
+        <rect class="node" x="550" y="40" width="170" height="80"/>
+        <text x="635" y="62" text-anchor="middle">
+          <tspan class="title">handshake::execute_handshake</tspan>
+          <tspan x="635" dy="18">autheo-pqc-core/src/handshake.rs</tspan>
+        </text>
+      </a>
+      <a href="./pqcnet-contracts/autheo-pqc-core/src/qs_dag.rs">
+        <rect class="node" x="740" y="40" width="170" height="80"/>
+        <text x="825" y="66" text-anchor="middle">
+          <tspan class="title">QsDagPqc</tspan>
+          <tspan x="825" dy="18">autheo-pqc-core/src/qs_dag.rs</tspan>
+        </text>
+      </a>
+      <a href="./pqcnet-contracts/autheo-pqc-core/src/key_manager.rs">
+        <rect class="node" x="500" y="160" width="170" height="80"/>
+        <text x="585" y="186" text-anchor="middle">
+          <tspan class="title">KeyManager</tspan>
+          <tspan x="585" dy="18">autheo-pqc-core/src/key_manager.rs</tspan>
+        </text>
+      </a>
+      <a href="./pqcnet-contracts/autheo-pqc-core/src/signatures.rs">
+        <rect class="node" x="690" y="160" width="170" height="80"/>
+        <text x="775" y="186" text-anchor="middle">
+          <tspan class="title">SignatureManager</tspan>
+          <tspan x="775" dy="18">autheo-pqc-core/src/signatures.rs</tspan>
+        </text>
+      </a>
+      <rect class="node passive" x="740" y="250" width="170" height="60"/>
+      <text x="825" y="280" text-anchor="middle">
+        <tspan class="title">Validator set</tspan>
+      </text>
+    </g>
+    <g marker-end="url(#arrow)">
+      <line x1="150" y1="80" x2="170" y2="80"/>
+      <line x1="340" y1="80" x2="360" y2="80"/>
+      <line x1="530" y1="80" x2="550" y2="80"/>
+      <line x1="720" y1="80" x2="740" y2="80"/>
+      <line x1="825" y1="120" x2="825" y2="250"/>
+      <line x1="635" y1="120" x2="585" y2="160"/>
+      <line x1="635" y1="120" x2="775" y2="160"/>
+    </g>
+  </svg>
+  <figcaption>Hover to highlight a component; click to inspect the exact source file.</figcaption>
+</figure>
 
 ---
 
